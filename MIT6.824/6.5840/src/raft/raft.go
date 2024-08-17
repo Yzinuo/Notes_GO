@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -80,6 +81,7 @@ type Raft struct {
 	state       NodeState // 0 -follower   1 - conditate  2 - leader
 	timestamp   time.Time
 	applycond   *sync.Cond
+	applychan	chan ApplyMsg
 	//不需要持久保存的易失状态，丢失同步Leader就行
 	logs 		[]LogEntry
 	commitIndex int //已提交的最高日志项的索引
@@ -192,7 +194,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("[%v]receried the request vote from [%v], Term : [%v]",rf.me,args.CandidateId,rf.currentTerm)
+	Debug(dVote,"[%v]receried the request vote from [%v], Term : [%v]",rf.me,args.CandidateId,rf.currentTerm)
 	
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -212,20 +214,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votefor = args.CandidateId
 			rf.timestamp = time.Now()
-			DPrintf("[term : %v] : [%v] vote for  [%v]",args.Term,rf.me,args.CandidateId)
+			Debug(dVote,"[term : %v] : [%v] vote for  [%v]",args.Term,rf.me,args.CandidateId)
 			return
 		}
 	}
+	reply.VoteGranted = false
 }
 
 // received heartbeat handler
 func (rf *Raft)AppendEntry(args *AppendEntries, reply *AppendEntriesreply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("[term %d]: Raft[%d] [state %d] receive AppendEntries from Raft[%d]", rf.currentTerm, rf.me, rf.state, args.LeaderId)
+	Debug(dLog2,"[term %d]: Raft[%d] [state %d] receive AppendEntries from Raft[%d]", rf.currentTerm, rf.me, rf.state, args.LeaderId)
 	
 	if args.Term < rf.currentTerm{
 		reply.Term = rf.currentTerm
+		Debug(dTerm,"receiver [%v] has bigger term", rf.me)
 		reply.Success = false
 		return
 	}else if(args.Term > rf.currentTerm){
@@ -235,22 +239,26 @@ func (rf *Raft)AppendEntry(args *AppendEntries, reply *AppendEntriesreply){
 	}
 	
 	reply.Success = true
-	if(rf.logs[args.PreLogIndex].Term != args.PreLogTerm){
+	if(args.PreLogIndex >= len(rf.logs) ||rf.logs[args.PreLogIndex].Term != args.PreLogTerm){
 		reply.Success = false
-		DPrintf("[%v] The log is inconsistent with the leader",rf.me)
+		Debug(dLog2,"[%v] The log is inconsistent with the leader",rf.me)
+		return
 	}
 
 	for i :=0; i < len(args.Entries); i++{
 		index := args.Entries[i].Index
-		if(index <= len(rf.logs)-1 && rf.logs[index].Command != args.Entries[i].Command){
-			DPrintf("[%v] logs index [%v] conflicts with new one",rf.me,index)
-			rf.logs = rf.logs[:index-1]	
+		if(index <= len(rf.logs)-1 && rf.logs[index].Term != args.Entries[i].Term){
+			Debug(dLog2,"[%v] logs index [%v] conflicts with new one",rf.me,index)
+			rf.logs = rf.logs[:index]	
 		}
-		rf.logs = append(rf.logs, args.Entries[index])
+		rf.logs = append(rf.logs, args.Entries[i])
 	}
 
 	if(args.LeaderCommit > rf.commitIndex){
 		rf.commitIndex = min(args.LeaderCommit,len(rf.logs)-1)
+		if rf.commitIndex > rf.lastApplied{
+			rf.applycond.Broadcast()
+		}
 	}
 
 	reply.Term = args.Term
@@ -264,13 +272,14 @@ func min(a, b int) int {
 	return b
 }
 
-func (rf *Raft)checkAppendresult(server int, args *AppendEntries){
+func (rf *Raft)checkAppendresult(server int, args *AppendEntries) bool{
+	Debug(dLog,"[term %d]:Raft [%d] [state %d] sends appendentries RPC to server[%d]", rf.currentTerm, rf.me, rf.state, server)
 	reply := AppendEntriesreply{}
 	ok := rf.sendAppendEntries(server,args,&reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if !ok{
-		DPrintf("[%v] term :[%v] received AppendEntries form [%v] Term :[%v] unsuccess",server,reply.Term,rf.me,rf.currentTerm)
+		Debug(dLog2,"[%v] term :[%v] received AppendEntries form [%v] Term :[%v] unsuccess",server,reply.Term,rf.me,rf.currentTerm)
 	}
 
 	if reply.Term > rf.currentTerm {
@@ -279,22 +288,101 @@ func (rf *Raft)checkAppendresult(server int, args *AppendEntries){
 		rf.timestamp = time.Now()
 		rf.votefor = -1
 	}
+	return reply.Success
+}
+
+//检查有客户端有没有消息发送到Leader，如果有且大于等于服务器的nextIndex则发送带有日志的AppendEntries
+func (rf *Raft) checknewEntry(server int){
+	newargs := AppendEntries{}
+	for{	
+		rf.mu.Lock()
+		if rf.state != Leader || rf.killed(){
+			rf.mu.Unlock()
+			return
+		}
+		lastIndex := len(rf.logs)-1
+		nextindex := rf.nextIndex[server]
+		newargs.Entries = rf.logs[nextindex:]
+		newargs.PreLogIndex = nextindex-1
+		newargs.PreLogTerm = rf.logs[nextindex-1].Term
+		newargs.LeaderCommit = rf.commitIndex
+		newargs.Term = rf.currentTerm
+		rf.mu.Unlock()
+
+		if(lastIndex >= nextindex){
+			Debug(dLog,"[Raft %v], send a new log to server[%v]",rf.me,server)
+			result := rf.checkAppendresult(server,&newargs)
+			rf.mu.Lock()
+			// 出现了term confusion
+			if newargs.Term != rf.currentTerm{
+				rf.mu.Unlock()
+				return
+			}
+			if result {
+				rf.nextIndex[server] = lastIndex+1
+				rf.matchIndex[server] = lastIndex
+				Debug(dLog,"[term %d]: Raft[%d] successfully append entries to Raft[%d]", rf.currentTerm, rf.me, server)
+			}else{
+				rf.nextIndex[server] = int(math.Max(1.0, float64(rf.nextIndex[server]-1)))
+				rf.mu.Unlock()
+				continue
+			}
+			rf.mu.Unlock()
+		}
+		time.Sleep(time.Millisecond * time.Duration(10))
+	}
+}
+
+func (rf *Raft) checkcommit(){
+	for{
+		rf.mu.Lock()
+		if rf.killed() || rf.state != Leader{
+			rf.mu.Unlock()
+			return
+		}
+
+		if len(rf.logs)-1 > rf.commitIndex{
+				termcommit := rf.commitIndex+1
+				// 找到最新的可提交的索引,每次只提交一个
+				sum := 0
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me{
+						continue
+					}
+					
+					if rf.matchIndex[i] >= termcommit {
+							sum++
+					}
+				}
+
+				if sum > len(rf.peers)/2 && rf.logs[termcommit].Term == rf.currentTerm{
+					Debug(dCommit,"term : [%v]  Raft :[%v] has change the commitx successfully",rf.currentTerm,rf.me)
+					rf.commitIndex = termcommit
+					rf.applycond.Broadcast()
+				}
+			}
+		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * time.Duration(10))
+	}
 }
 
 func (rf *Raft) startsendAppend(){
 	timeout := time.Duration(150) *time.Millisecond
+
 	for rf.killed() == false{
 		if(rf.state == Leader){
 			rf.mu.Lock()
 			args := AppendEntries{
-				Term: rf.currentTerm,
-				LeaderId: rf.me,
-				PreLogIndex: len(rf.logs)-1,
-				PreLogTerm: rf.logs[len(rf.logs)-1].Term,
-				Entries: make([]LogEntry,0),
-				LeaderCommit: rf.commitIndex,
-			}
-			rf.mu.Unlock()
+					Term: rf.currentTerm,
+					LeaderId: rf.me,
+					PreLogIndex: len(rf.logs)-1,
+					PreLogTerm: rf.logs[len(rf.logs)-1].Term,
+					Entries: make([]LogEntry,0),
+					LeaderCommit: rf.commitIndex,
+				}	
+			rf.mu.Unlock()	
+			
+
 			for server := range rf.peers{
 				if server == rf.me{
 					continue
@@ -303,6 +391,7 @@ func (rf *Raft) startsendAppend(){
 			}
 		}
 		time.Sleep(timeout)
+		
 	}
 }
 // example code to send a RequestVote RPC to a server.
@@ -367,7 +456,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Unlock()
 		return index,term,false
 	}
-	DPrintf("[term %d]: Raft [%d] start recerived new log", rf.currentTerm, rf.me)
+	Debug(dClient,"[term %d]: Raft [%d] start recerived new log", rf.currentTerm, rf.me)
 	index = len(rf.logs)
 	term = rf.currentTerm
 	rf.logs = append(rf.logs,LogEntry{Command: command,
@@ -407,7 +496,7 @@ func (rf *Raft) ticker() {
 		
 		rf.mu.Lock()
 		if rf.state != Leader && time.Since(rf.timestamp) >= timeout{
-			go rf.startElectoin()	
+			go rf.startElection()	
 		}		
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
@@ -417,14 +506,14 @@ func (rf *Raft) ticker() {
 	}
 }
 
-func (rf *Raft)startElectoin(){
+func (rf *Raft)startElection(){
 	rf.mu.Lock()
 	rf.state = Candidate
 	rf.currentTerm += 1
 	rf.timestamp = time.Now()
 	rf.votefor = rf.me
 
-	DPrintf("[%v] start election,Term:[%v]",rf.me,rf.currentTerm)
+	Debug(dVote,"[%v] start election,Term:[%v]",rf.me,rf.currentTerm)
 	
 	// send voterequest to others
 	votenum := 1
@@ -442,7 +531,7 @@ func (rf *Raft)startElectoin(){
 
 	for server := range rf.peers{
 		if server == rf.me{
-			DPrintf("[%v] vote for himself",rf.me)
+			Debug(dVote,"[%v] vote for himself",rf.me)
 			continue
 		}
 		go func(server int){
@@ -455,22 +544,35 @@ func (rf *Raft)startElectoin(){
 			votemux.Lock()
 			if result && !electionfinished {
 				votenum++
-				DPrintf("[%v] vote for the condidate [%v]",server,rf.me)	
+				Debug(dVote,"[%v] vote for the condidate [%v]",server,rf.me)	
 				if votenum > len(rf.peers)/2{
 					electionfinished = true
 					rf.mu.Lock()
 					rf.state = Leader
+					for i:= 0; i < len(rf.peers); i++{
+						rf.nextIndex[i] = len(rf.logs)
+						rf.matchIndex[i] = 0
+					}
 					rf.mu.Unlock()
-					DPrintf("[%v] become new Leader",rf.me)
-					rf.startsendAppend()
+					Debug(dLeader,"[%v] become new Leader",rf.me)
+					go rf.startsendAppend()
+					go rf.allocateAppendCheckers()
+					go rf.checkcommit()
 				}
 			}
 			votemux.Unlock()
 		}(server)
 	}
-
 }
 
+func (rf *Raft) allocateAppendCheckers(){
+	for i:=0; i < len(rf.peers); i++{
+		if i == rf.me{
+			continue
+		}
+		go rf.checknewEntry(i)
+	}
+}
 func (rf *Raft) CheckVoteResult(server int,args *RequestVoteArgs) bool{
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(server,args,&reply)
@@ -485,7 +587,7 @@ func (rf *Raft) CheckVoteResult(server int,args *RequestVoteArgs) bool{
 	}
 
 	if reply.Term > args.Term{
-		DPrintf(" condidate [%v] Term :[%v] recerived higher term [%v] from others ",args.CandidateId,args.Term,reply.Term)
+		Debug(dVote," condidate [%v] Term :[%v] recerived higher term [%v] from others ",args.CandidateId,args.Term,reply.Term)
 		rf.state = Follower
 		rf.currentTerm = reply.Term
 		rf.votefor = -1
@@ -493,6 +595,28 @@ func (rf *Raft) CheckVoteResult(server int,args *RequestVoteArgs) bool{
 	}
 	return reply.VoteGranted
 }
+
+func (rf *Raft)checkApply(){
+	for !rf.killed(){
+		rf.mu.Lock()
+	// 信号量的用法就是需要持有对应的锁，不会造成死锁。
+		for rf.lastApplied >= rf.commitIndex{
+			rf.applycond.Wait()
+		}
+		
+		rf.lastApplied++
+		Debug(dCommit,"[Term : %v],Raft :%v [state %d] ready to apply the new log [%v] to statemachine,",rf.currentTerm,rf.me,rf.state,rf.lastApplied)
+		Msg := ApplyMsg{
+			CommandValid: true,
+			Command: rf.logs[rf.lastApplied].Command,
+			CommandIndex: rf.lastApplied,
+		}
+		rf.mu.Unlock()
+		rf.applychan <- Msg
+		Debug(dCommit,"[Term : %v] [Raft :%v]  [state %d] send new log to statemachine successfully",rf.currentTerm,rf.me,rf.state)
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -525,11 +649,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votefor = -1
 	rf.applycond = sync.NewCond(&rf.mu)
+	rf.applychan = applyCh
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	// 开启一个goroutine来检测是否有需要应用到状态机的日志
+	go rf.checkApply()
 	return rf
 }

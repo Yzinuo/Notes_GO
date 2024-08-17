@@ -32,7 +32,7 @@ const (
 // Debugging
 const isDebug = false
 
-func D1(format string, a ...interface{}) (n int, err error) {
+func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if isDebug {
 		log.Printf(format, a...)
 	}

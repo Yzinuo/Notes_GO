@@ -214,7 +214,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votefor = args.CandidateId
 			rf.timestamp = time.Now()
-			Debug(dVote,"[term : %v] : [%v] vote for  [%v]",args.Term,rf.me,args.CandidateId)
+			Debug(dVote,"[%v] [term : %v] vote for  [%v]",rf.me,args.Term,args.CandidateId)
 			return
 		}
 	}
@@ -225,11 +225,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft)AppendEntry(args *AppendEntries, reply *AppendEntriesreply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Debug(dLog2,"[term %d]: Raft[%d] [state %d] receive AppendEntries from Raft[%d]", rf.currentTerm, rf.me, rf.state, args.LeaderId)
+	Debug(dLog2,"[%v] [term %d] [state %d] receive AppendEntries from Raft[%d]", rf.me,rf.currentTerm, rf.state, args.LeaderId)
 	
 	if args.Term < rf.currentTerm{
 		reply.Term = rf.currentTerm
-		Debug(dTerm,"receiver [%v] has bigger term", rf.me)
+		Debug(dTerm,"[%v](the receriver) has bigger term", rf.me)
 		reply.Success = false
 		return
 	}else if(args.Term > rf.currentTerm){
@@ -257,6 +257,7 @@ func (rf *Raft)AppendEntry(args *AppendEntries, reply *AppendEntriesreply){
 	if(args.LeaderCommit > rf.commitIndex){
 		rf.commitIndex = min(args.LeaderCommit,len(rf.logs)-1)
 		if rf.commitIndex > rf.lastApplied{
+			Debug(dCommit, "[%v] Trem:%v state:%v updated commitindex %v ready to appy new logs",rf.currentTerm,rf.me,rf.state,rf.commitIndex)
 			rf.applycond.Broadcast()
 		}
 	}
@@ -273,13 +274,14 @@ func min(a, b int) int {
 }
 
 func (rf *Raft)checkAppendresult(server int, args *AppendEntries) bool{
-	Debug(dLog,"[term %d]:Raft [%d] [state %d] sends appendentries RPC to server[%d]", rf.currentTerm, rf.me, rf.state, server)
+	Debug(dLog,"[%v] term %d state %d sends appendentries RPC to server%d",rf.me,rf.currentTerm,rf.state, server)
 	reply := AppendEntriesreply{}
 	ok := rf.sendAppendEntries(server,args,&reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if !ok{
-		Debug(dLog2,"[%v] term :[%v] received AppendEntries form [%v] Term :[%v] unsuccess",server,reply.Term,rf.me,rf.currentTerm)
+		Debug(dLog2,"[%v] fail to receive AppendEntries form [%v] Term :[%v]",server,rf.me,rf.currentTerm)
+		return false
 	}
 
 	if reply.Term > rf.currentTerm {
@@ -308,9 +310,9 @@ func (rf *Raft) checknewEntry(server int){
 		newargs.LeaderCommit = rf.commitIndex
 		newargs.Term = rf.currentTerm
 		rf.mu.Unlock()
-
+		newargs.LeaderId = rf.me
 		if(lastIndex >= nextindex){
-			Debug(dLog,"[Raft %v], send a new log to server[%v]",rf.me,server)
+			Debug(dLog,"[%v]  [term %d] [state %d] lastIndex:%v sends appendentries RPC **with new logs** to server[%d]",  rf.me,rf.currentTerm, rf.state,lastIndex,server)
 			result := rf.checkAppendresult(server,&newargs)
 			rf.mu.Lock()
 			// 出现了term confusion
@@ -321,7 +323,7 @@ func (rf *Raft) checknewEntry(server int){
 			if result {
 				rf.nextIndex[server] = lastIndex+1
 				rf.matchIndex[server] = lastIndex
-				Debug(dLog,"[term %d]: Raft[%d] successfully append entries to Raft[%d]", rf.currentTerm, rf.me, server)
+				Debug(dLog,"[%v]  [term %d]successfully append entries to Raft[%d] lastindex:%v",  rf.me,rf.currentTerm, server,lastIndex)
 			}else{
 				rf.nextIndex[server] = int(math.Max(1.0, float64(rf.nextIndex[server]-1)))
 				rf.mu.Unlock()
@@ -344,7 +346,7 @@ func (rf *Raft) checkcommit(){
 		if len(rf.logs)-1 > rf.commitIndex{
 				termcommit := rf.commitIndex+1
 				// 找到最新的可提交的索引,每次只提交一个
-				sum := 0
+				sum := 1
 				for i := 0; i < len(rf.peers); i++ {
 					if i == rf.me{
 						continue
@@ -356,8 +358,8 @@ func (rf *Raft) checkcommit(){
 				}
 
 				if sum > len(rf.peers)/2 && rf.logs[termcommit].Term == rf.currentTerm{
-					Debug(dCommit,"term : [%v]  Raft :[%v] has change the commitx successfully",rf.currentTerm,rf.me)
 					rf.commitIndex = termcommit
+					Debug(dCommit,"[%v]  term : [%v]  has change the commitx successfully new commitindex is %v",rf.me,rf.currentTerm,rf.commitIndex)
 					rf.applycond.Broadcast()
 				}
 			}
@@ -366,7 +368,7 @@ func (rf *Raft) checkcommit(){
 	}
 }
 
-func (rf *Raft) startsendAppend(){
+func (rf *Raft) startsendHb(){
 	timeout := time.Duration(150) *time.Millisecond
 
 	for rf.killed() == false{
@@ -456,7 +458,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Unlock()
 		return index,term,false
 	}
-	Debug(dClient,"[term %d]: Raft [%d] start recerived new log", rf.currentTerm, rf.me)
+	Debug(dClient,"[%d] [term %d] start recerived new log", rf.me,rf.currentTerm)
 	index = len(rf.logs)
 	term = rf.currentTerm
 	rf.logs = append(rf.logs,LogEntry{Command: command,
@@ -555,7 +557,7 @@ func (rf *Raft)startElection(){
 					}
 					rf.mu.Unlock()
 					Debug(dLeader,"[%v] become new Leader",rf.me)
-					go rf.startsendAppend()
+					go rf.startsendHb()
 					go rf.allocateAppendCheckers()
 					go rf.checkcommit()
 				}
@@ -587,7 +589,7 @@ func (rf *Raft) CheckVoteResult(server int,args *RequestVoteArgs) bool{
 	}
 
 	if reply.Term > args.Term{
-		Debug(dVote," condidate [%v] Term :[%v] recerived higher term [%v] from others ",args.CandidateId,args.Term,reply.Term)
+		Debug(dVote,"[%v] become candidate, Term :[%v] recerived higher term [%v] from others ",args.CandidateId,args.Term,reply.Term)
 		rf.state = Follower
 		rf.currentTerm = reply.Term
 		rf.votefor = -1
@@ -605,7 +607,7 @@ func (rf *Raft)checkApply(){
 		}
 		
 		rf.lastApplied++
-		Debug(dCommit,"[Term : %v],Raft :%v [state %d] ready to apply the new log [%v] to statemachine,",rf.currentTerm,rf.me,rf.state,rf.lastApplied)
+		Debug(dCommit,"[%v] [Term : %v] [state %d] ready to apply the new log [%v] to statemachine,",rf.me,rf.currentTerm,rf.state,rf.lastApplied)
 		Msg := ApplyMsg{
 			CommandValid: true,
 			Command: rf.logs[rf.lastApplied].Command,
@@ -613,7 +615,7 @@ func (rf *Raft)checkApply(){
 		}
 		rf.mu.Unlock()
 		rf.applychan <- Msg
-		Debug(dCommit,"[Term : %v] [Raft :%v]  [state %d] send new log to statemachine successfully",rf.currentTerm,rf.me,rf.state)
+		Debug(dCommit,"[%v] [Term : %v] [state %d] send new log to statemachine successfully",rf.me,rf.currentTerm,rf.state)
 	}
 }
 

@@ -19,12 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -113,14 +115,14 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+
+	 w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votefor)
+	e.Encode(rf.logs)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -128,19 +130,20 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var vote int
+	var log []LogEntry
+	if d.Decode(&term) != nil ||
+	   d.Decode(&vote) != nil ||
+	   d.Decode(&log) != nil {
+		Debug(dPersist,"Term : %t, Vote : %t , Log : %t",term == 0, vote == 0, log == nil)
+	} else {
+	  rf.currentTerm = term
+	  rf.votefor = vote
+	  rf.logs = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -180,9 +183,10 @@ type AppendEntries struct {
 }
 
 type AppendEntriesreply struct {
-	Term        int
-	Success     bool
-	Upnextindex int
+	Term        		int
+	Success     		bool
+	ConflictTerm	    int
+	FirstConflictIndex  int
 }
 
 // example RequestVote RPC handler.
@@ -201,6 +205,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votefor = -1
+		rf.persist()
 	}
 
 	if rf.votefor == -1 || rf.votefor == args.CandidateId {
@@ -211,6 +216,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votefor = args.CandidateId
 			rf.timestamp = time.Now()
+			rf.persist()
 			Debug(dVote, "[%v] [term : %v] vote for  [%v]", rf.me, args.Term, args.CandidateId)
 			return
 		} else {
@@ -230,15 +236,14 @@ func (rf *Raft) AppendEntry(args *AppendEntries, reply *AppendEntriesreply) {
 		Debug(dTerm, "[%v](the receriver) has bigger term", rf.me)
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		reply.Upnextindex = -1
 		return
 	} else if args.Term > rf.currentTerm {
 		rf.state = Follower
 		rf.currentTerm = args.Term
 		rf.votefor = -1 // haven't vote yet
+		rf.persist()
 	}
 
-	reply.Upnextindex = -1
 	reply.Success = true
 	reply.Term = rf.currentTerm
 	rf.timestamp = time.Now()
@@ -247,12 +252,12 @@ func (rf *Raft) AppendEntry(args *AppendEntries, reply *AppendEntriesreply) {
 	if args.PreLogIndex >= len(rf.logs) {
 		Debug(dLog2, "[%v] some logs are missing,now lastindex : %v", rf.me, len(rf.logs)-1)
 		reply.Success = false
-		reply.Upnextindex = len(rf.logs) //??
+		reply.FirstConflictIndex = len(rf.logs)
 		return
 	} else if rf.logs[args.PreLogIndex].Term != args.PreLogTerm {
 		Debug(dLog2, "[%v] The log is inconsistent with the leader,conflicts index :%v ,term :%v", rf.me,args.PreLogIndex,args.Term)
 		reply.Success = false
-		reply.Upnextindex = rf.findMinInoneterm(args.PreLogTerm, args.PreLogIndex)
+		reply.ConflictTerm,reply.FirstConflictIndex = rf. findFirstConflict(args.PreLogIndex)
 		return
 	}
 
@@ -266,6 +271,7 @@ func (rf *Raft) AppendEntry(args *AppendEntries, reply *AppendEntriesreply) {
 			rf.logs = append(rf.logs, args.Entries[i])
 		}
 	}
+	rf.persist()
 
 	if args.LeaderCommit > rf.commitIndex {
 		oricommitindex := rf.commitIndex
@@ -277,23 +283,16 @@ func (rf *Raft) AppendEntry(args *AppendEntries, reply *AppendEntriesreply) {
 	}
 }
 
-// 找到同一Term内index最小的日志
-func (rf *Raft) findMinInoneterm(term int, index int) int {
-	if term == 0 {
-		return 0
-	}
-	minIndex := index
-	// todo
-	for i := index-1; i >= 1; i-- {
-		if rf.logs[i].Term != term {
-			minIndex = i + 1
+func (rf *Raft) findFirstConflict(index int) (int ,int){
+	conflictTerm := rf.logs[index].Term
+	firstConflictIndex := index
+	for i := index -1; i >=1;i--{
+		if term := rf.logs[i].Term; term != conflictTerm{
 			break
 		}
-	}
-	if minIndex == index {
-		Debug(dInfo, "[%v] 没有获取 endIndex 范围内, 任期为 term 且 index 最小的日志条目", rf.me)
-	}
-	return minIndex
+		firstConflictIndex = i
+	} 
+	return conflictTerm,firstConflictIndex
 }
 
 func min(a, b int) int {
@@ -318,12 +317,23 @@ func (rf *Raft) checkAppendresult(server int, args *AppendEntries) bool {
 		rf.currentTerm = reply.Term
 		rf.state = Follower
 		rf.votefor = -1
+		rf.persist()
 		return false
 	}
 
-	if !reply.Success && reply.Upnextindex != -1 {
-		rf.nextIndex[server] = reply.Upnextindex
-		Debug(dLog2, "[%v] has changed the nextindex . now  it is %v", server, reply.Upnextindex)
+	if !reply.Success && reply.FirstConflictIndex != 0 {
+		newNextIndex := reply.FirstConflictIndex
+		// warning: skip the snapshot index since it cannot conflict if all goes well.
+		if reply.ConflictTerm != 0 {
+			for i := len(rf.logs)-1; i >= 1 ; i-- {
+				if term:= rf.logs[i].Term; term == reply.ConflictTerm {
+					newNextIndex = i
+					break
+				}
+			}
+		}
+		rf.nextIndex[server] = newNextIndex
+		Debug(dLog2, "[%v] has changed the nextindex . now  it is %v", server, newNextIndex)
 	}
 	return reply.Success
 }
@@ -368,7 +378,7 @@ func (rf *Raft) checknewEntry(server int) {
 			}
 			rf.mu.Unlock()
 		}
-		time.Sleep(time.Millisecond * time.Duration(10))
+		time.Sleep(time.Millisecond * time.Duration(5))
 	}
 }
 
@@ -401,7 +411,7 @@ func (rf *Raft) checkcommit() {
 			}
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Millisecond * time.Duration(10))
+		time.Sleep(time.Millisecond * time.Duration(5))
 	}
 }
 
@@ -424,19 +434,6 @@ func (rf *Raft) startsendHb() {
 				if server == rf.me {
 					continue
 				}
-				// rf.mu.Lock()
-				// args := AppendEntries{
-				// 	Term:         rf.currentTerm,
-				// 	LeaderId:     rf.me,
-				// 	PreLogIndex:  rf.nextIndex[server] - 1,
-				// 	PreLogTerm:   rf.logs[rf.nextIndex[server]-1].Term,
-				// 	Entries:      make([]LogEntry, 0),
-				// 	LeaderCommit: rf.commitIndex,
-				// }
-				// if(len(rf.logs)-1 > rf.nextIndex[server]){
-				// 	args.Entries = rf.logs[rf.nextIndex[server]:]
-				// }
-				// rf.mu.Unlock()
 				go rf.checkAppendresult(server, &args)
 			}
 		}
@@ -444,29 +441,6 @@ func (rf *Raft) startsendHb() {
 	}
 }
 
-// func (rf *Raft) startsendHb_once(){
-// 	if rf.state == Leader {
-// 		for server := range rf.peers {
-// 			if server == rf.me {
-// 				continue
-// 			}
-// 			rf.mu.Lock()
-// 			args := AppendEntries{
-// 				Term:         rf.currentTerm,
-// 				LeaderId:     rf.me,
-// 				PreLogIndex:  rf.nextIndex[server] - 1,
-// 				PreLogTerm:   rf.logs[rf.nextIndex[server]-1].Term,
-// 				Entries:      make([]LogEntry, 0),
-// 				LeaderCommit: rf.commitIndex,
-// 			}
-// 			if(len(rf.logs)-1 > rf.nextIndex[server]){
-// 				args.Entries = rf.logs[rf.nextIndex[server]:]
-// 			}
-// 			rf.mu.Unlock()
-// 			go rf.checkAppendresult(server, &args)
-// 		}
-// 	}
-// }
 
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -536,6 +510,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logs = append(rf.logs, LogEntry{Command: command,
 		Index: index,
 		Term:  term})
+	rf.persist()
 	rf.mu.Unlock()
 
 	return index, term, isLeader
@@ -586,8 +561,8 @@ func (rf *Raft) startElection() {
 	rf.currentTerm += 1
 	rf.timestamp = time.Now()
 	rf.votefor = rf.me
-
-	Debug(dVote, "[%v] start election,Term:[%v]", rf.me, rf.currentTerm)
+	rf.persist()
+	Debug(dVote, "[%v] start election,Term:[%v] Lastindex:[%v] LastTerm:[%v]", rf.me, rf.currentTerm,len(rf.logs)-1,rf.logs[len(rf.logs)-1].Term)
 
 	// send voterequest to others
 	votenum := 1
@@ -665,6 +640,7 @@ func (rf *Raft) CheckVoteResult(server int, args *RequestVoteArgs) bool {
 		rf.state = Follower
 		rf.currentTerm = reply.Term
 		rf.votefor = -1
+		rf.persist()
 		return false
 	}
 	return reply.VoteGranted

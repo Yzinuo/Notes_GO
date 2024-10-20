@@ -32,3 +32,9 @@ https://github.com/niebayes/MIT-6.5840/blob/no_logging/src/raft/log.go#L68
 https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab2.md#%E6%97%A5%E5%BF%97%E5%8E%8B%E7%BC%A9
 
 **此外MIT6.824里面有我自己对raft的理解，实现时踩得坑和注意事项 希望能帮助你们**
+
+## 设计模式
+[GO语言设计模式](https://github.com/kevinyan815/design-pattern-by-go)
+
+## Go语言常见的一百个错误
+[100个错误](https://github.com/UltimateYhq/100-GO-mistakes)
